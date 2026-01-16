@@ -219,11 +219,14 @@ def main():
                 axis=1
             )
             
-            # Color code by confidence
+            # Color code by confidence (FIXED: access original dataframe via index)
             def highlight_confidence(row):
-                if row['confidence'] == 'elite':
+                # Use the row's index to get the confidence from original dataframe
+                idx = row.name
+                conf = today.loc[idx, 'confidence']
+                if conf == 'elite':
                     return ['background-color: rgba(255, 107, 107, 0.2)'] * len(row)
-                elif row['confidence'] == 'high':
+                elif conf == 'high':
                     return ['background-color: rgba(78, 205, 196, 0.2)'] * len(row)
                 return [''] * len(row)
             
@@ -232,7 +235,7 @@ def main():
             
             st.dataframe(
                 display[show_cols].style.apply(highlight_confidence, axis=1),
-                use_container_width=True,
+                width="stretch",  # FIXED: replaced use_container_width
                 hide_index=True,
                 height=400
             )
@@ -289,7 +292,7 @@ def main():
                                annotation_text=f"Average ({overall_wr:.1%})")
                 fig_wr.update_yaxes(tickformat=".0%")
                 fig_wr.update_layout(height=400)
-                st.plotly_chart(fig_wr, use_container_width=True)
+                st.plotly_chart(fig_wr, width="stretch")  # FIXED
 
             # Cumulative Profit
             with col2:
@@ -306,7 +309,7 @@ def main():
                 colors = ['green' if x > 0 else 'red' for x in daily['cumulative_profit']]
                 fig_cp.update_traces(line_color='#4ECDC4', marker=dict(color=colors))
                 fig_cp.update_layout(height=400)
-                st.plotly_chart(fig_cp, use_container_width=True)
+                st.plotly_chart(fig_cp, width="stretch")  # FIXED
             
             # Data table
             st.markdown("---")
@@ -319,7 +322,7 @@ def main():
             
             st.dataframe(
                 display_daily.sort_values('date', ascending=False),
-                use_container_width=True,
+                width="stretch",  # FIXED
                 hide_index=True
             )
 
@@ -360,7 +363,7 @@ def main():
                 yaxis_title="Profit (Units)",
                 height=400
             )
-            st.plotly_chart(fig_mkt, use_container_width=True)
+            st.plotly_chart(fig_mkt, width="stretch")  # FIXED
             
             # Detailed breakdown by confidence
             st.markdown("---")
@@ -375,7 +378,7 @@ def main():
                 if not elite.empty:
                     elite_display = elite[['market', 'picks', 'wins', 'win_rate', 'profit_units']].copy()
                     elite_display['market'] = elite_display['market'].str.upper()
-                    st.dataframe(elite_display, use_container_width=True, hide_index=True)
+                    st.dataframe(elite_display, width="stretch", hide_index=True)  # FIXED
                 else:
                     st.info("No elite picks in this period")
             
@@ -386,7 +389,7 @@ def main():
                 if not high.empty:
                     high_display = high[['market', 'picks', 'wins', 'win_rate', 'profit_units']].copy()
                     high_display['market'] = high_display['market'].str.upper()
-                    st.dataframe(high_display, use_container_width=True, hide_index=True)
+                    st.dataframe(high_display, width="stretch", hide_index=True)  # FIXED
                 else:
                     st.info("No high picks in this period")
 
