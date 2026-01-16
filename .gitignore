@@ -1,52 +1,69 @@
-# Byte-compiled / optimized / DLL files
+# ================================
+# Python bytecode / cache
+# ================================
 __pycache__/
 *.py[cod]
 *$py.class
+.Python
 
-# Streamlit secrets - NEVER commit this!
+# ================================
+# Streamlit secrets (NEVER COMMIT)
+# ================================
 .streamlit/secrets.toml
 
-# Virtual environment
+# ================================
+# Virtual environments
+# ================================
 venv/
 env/
 ENV/
 
-# IDE
+# ================================
+# Environment variables
+# ================================
+.env
+.env.local
+
+# ================================
+# IDE / editor files
+# ================================
 .vscode/
 .idea/
 *.swp
 *.swo
 
+# ================================
 # OS files
+# ================================
 .DS_Store
 Thumbs.db
 
-# Python
-*.pyc
-*.pyo
-*.pyd
-.Python
-
+# ================================
 # Distribution / packaging
+# ================================
 dist/
 build/
 *.egg-info/
 
+# ================================
 # Logs
+# ================================
 *.log
 
-# Database
+# ================================
+# Databases
+# ================================
 *.db
 *.sqlite
 
-# Environment variables
-.env
-.env.local
+# ================================
+# Jupyter
+# ================================
+.ipynb_checkpoints/
 
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# Docker (not needed for Streamlit Cloud)
+# ================================
+# Docker (not used for Streamlit Cloud)
+# ================================
 Dockerfile
 .dockerignore
 docker-compose.yml
