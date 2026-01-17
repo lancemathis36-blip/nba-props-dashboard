@@ -6,6 +6,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
 import json
+import re
 
 # ============================================================
 # CONFIG
@@ -52,15 +53,17 @@ bq_client = get_bq_client()
 def load_todays_picks_with_explanations():
     """
     Single query that loads today's picks WITH explanations joined.
-    This eliminates the "multiple queries on rerun" problem.
+    Shows both AM and PM runs if they exist.
     """
     query = f"""
-    WITH latest_run AS (
-        SELECT run_id, run_type, as_of_ts
+    WITH latest_runs AS (
+        SELECT
+            run_type,
+            ARRAY_AGG(STRUCT(run_id, as_of_ts) ORDER BY as_of_ts DESC LIMIT 1)[OFFSET(0)] AS r
         FROM `{PROJECT_ID}.{BQ_DATASET}.picks_fact_over_under_graded`
         WHERE DATE(game_date) = CURRENT_DATE('{BQ_TZ}')
-        ORDER BY as_of_ts DESC
-        LIMIT 1
+          AND run_type IN ('AM', 'PM')
+        GROUP BY run_type
     )
     SELECT
         p.run_id, p.run_type, p.as_of_ts,
@@ -77,15 +80,17 @@ def load_todays_picks_with_explanations():
         e.full_explanation_json
 
     FROM `{PROJECT_ID}.{BQ_DATASET}.picks_fact_over_under_graded` p
-    INNER JOIN latest_run lr ON p.run_id = lr.run_id
+    INNER JOIN latest_runs lr
+        ON p.run_type = lr.run_type
+        AND CAST(p.run_id AS STRING) = CAST(lr.r.run_id AS STRING)
     LEFT JOIN `{PROJECT_ID}.{BQ_DATASET}.pick_explanations` e
         ON e.game_date = CURRENT_DATE('{BQ_TZ}')
-        AND e.run_id = p.run_id
+        AND CAST(e.run_id AS STRING) = CAST(p.run_id AS STRING)
         AND e.game_id = p.game_id
         AND e.player_id = p.player_id
         AND e.market = p.market
     WHERE p.confidence IN ('elite', 'high')
-    ORDER BY p.bet_units DESC, ratio ASC
+    ORDER BY p.run_type DESC, p.bet_units DESC, ratio ASC
     """
     df = bq_client.query(query).to_dataframe()
     
@@ -218,58 +223,205 @@ def load_summary_stats(days):
     return df.iloc[0] if not df.empty else None
 
 # ============================================================
-# HELPER FUNCTIONS
+# SHAP EXPLANATION HELPERS
 # ============================================================
 
+FEATURE_LABELS = {
+    "num__usage_pm_l10": "Recent usage",
+    "num__pts_pm_l10": "Recent scoring rate",
+    "num__ast_pm_l10": "Recent assist rate",
+    "num__reb_pm_l10": "Recent rebound rate",
+    "num__mins_avg_l10": "Recent minutes",
+    "num__PRED_minutes": "Projected minutes tonight",
+    "num__PRED_team_total": "Projected team score",
+    "num__Opp_L10_Pace": "Opponent pace",
+    "num__Opp_L10_Off_Eff": "Opponent offensive efficiency",
+    "num__Opp_L10_Def_Eff": "Opponent defensive efficiency",
+    "num__Opp_Def_Reb_ZScore": "Opponent rebounding strength",
+    "num__days_of_rest": "Days of rest",
+    "num__vacated_mins_l10": "Vacated minutes (injuries)",
+    "num__vacated_usage_l10": "Vacated usage (injuries)",
+    "num__vacated_pts_l10": "Vacated scoring (injuries)",
+    "cat__archetype_Connector / Point Wing": "Playmaker archetype",
+}
+
+def parse_factor(exp: str):
+    """
+    Parses:
+      "num__usage_pm_l10 = 0.376 → decreases predicted AST (-0.39)"
+    Returns:
+      (feature, value, direction_word, impact)
+    """
+    if not exp or not isinstance(exp, str):
+        return None
+
+    left = exp.split("→")[0].strip() if "→" in exp else exp
+    m = re.match(r"(.+?)\s*=\s*([-\d\.]+)", left)
+    feature = m.group(1).strip() if m else None
+    value = float(m.group(2)) if (m and m.group(2) is not None) else None
+
+    direction_word = None
+    if "→" in exp:
+        right = exp.split("→", 1)[1].strip().lower()
+        if right.startswith("increases"):
+            direction_word = "up"
+        elif right.startswith("decreases"):
+            direction_word = "down"
+
+    m2 = re.search(r"\(([-+]\d+(\.\d+)?)\)", exp)
+    impact = float(m2.group(1)) if m2 else None
+
+    return feature, value, direction_word, impact
+
+def format_feature_value(feature: str, value: float):
+    if value is None:
+        return None
+    if feature in ("num__mins_avg_l10", "num__PRED_minutes"):
+        return f"{value:.1f} min"
+    if feature.endswith("_pm_l10"):
+        return f"{value:.3f}/min"
+    if feature == "num__days_of_rest":
+        return f"{int(round(value))} days"
+    if feature.startswith("cat__"):
+        return "Yes" if float(value) == 1.0 else "No"
+    if "team_total" in feature.lower():
+        return f"{value:.0f} pts"
+    if "pace" in feature.lower():
+        return f"{value:.1f}"
+    return f"{value:.2f}"
+
+def _safe_float_from_disp(value_disp: str):
+    """Extracts first float from a display string like '112 pts' or '101.5'."""
+    if value_disp is None:
+        return None
+    m = re.search(r"[-+]?\d+(\.\d+)?", str(value_disp))
+    return float(m.group(0)) if m else None
+
+def human_sentence(market: str, feature: str, value_disp: str, impact: float):
+    label = FEATURE_LABELS.get(feature, feature.replace("num__", "").replace("_", " "))
+    market_word = market.upper()
+    push = "boosting" if impact > 0 else "pulling"
+    direction = "up" if impact > 0 else "down"
+
+    # Minutes-based features
+    if feature in ("num__mins_avg_l10", "num__PRED_minutes"):
+        return f"**{label}** at **{value_disp}** is {push} the **{market_word}** projection {direction} (~{abs(impact):.2f})."
+
+    # Usage/role features
+    if feature == "num__usage_pm_l10":
+        if market.lower() in ("ast", "pra"):
+            return f"**{label}** (**{value_disp}**) suggests fewer playmaking chances, {push} **{market_word}** {direction} (~{abs(impact):.2f})."
+        return f"**{label}** (**{value_disp}**) signals shot volume, {push} **{market_word}** {direction} (~{abs(impact):.2f})."
+
+    # Scoring efficiency affecting assists
+    if feature == "num__pts_pm_l10" and market.lower() == "ast":
+        return f"**{label}** (**{value_disp}**) shifts role/shot profile, {push} assists {direction} (~{abs(impact):.2f})."
+
+    # Team scoring environment
+    if "team_total" in feature.lower():
+        tt = _safe_float_from_disp(value_disp)
+        tempo = "high-scoring" if (tt is not None and tt > 110) else "lower-scoring"
+        return f"**{label}** (**{value_disp}**, {tempo} environment) is {push} **{market_word}** {direction} (~{abs(impact):.2f})."
+
+    # Opponent pace
+    if "pace" in feature.lower():
+        pace = _safe_float_from_disp(value_disp)
+        speed = "fast" if (pace is not None and pace > 100) else "slow"
+        return f"**{label}** (**{value_disp}**, {speed} opponent) is {push} **{market_word}** {direction} (~{abs(impact):.2f})."
+
+    # Categorical archetype flags
+    if feature.startswith("cat__archetype"):
+        on_off = "present" if value_disp == "Yes" else "not present"
+        return f"**{label}** is **{on_off}**, {push} **{market_word}** {direction} (~{abs(impact):.2f})."
+
+    return f"**{label}** (**{value_disp}**) is {push} **{market_word}** {direction} (~{abs(impact):.2f})."
+
 def display_shap_explanation(pick_row):
-    """
-    Display SHAP explanation directly from the pick row.
-    No lookup needed - explanations are already joined in the data.
-    """
-    # Check if explanation data exists
-    if pd.isna(pick_row.get('summary')):
+    """Display SHAP explanation in human-readable format"""
+    if pd.isna(pick_row.get("summary")):
         st.info("💡 No explanation available for this pick yet")
-        st.caption("SHAP explanations are generated when you run the prediction script. If you haven't run the updated script yet, older picks won't have explanations.")
+        st.caption("SHAP explanations are generated when you run the prediction script with SHAP enabled.")
         return
-    
-    st.markdown("### 🔍 Why This Pick?")
-    
-    # Summary
-    st.markdown(f"**{pick_row['summary']}**")
-    
+
+    player = pick_row["player_name"]
+    market = str(pick_row["market"]).upper()
+    side = str(pick_row["side"]).upper()
+    line = float(pick_row["line_use"])
+    pred = float(pick_row["pred_use"])
+
+    diff = abs(pred - line)
+    below_above = "below" if pred < line else "above"
+
+    st.markdown("### 🔍 Why this pick?")
+
+    conf = str(pick_row.get("confidence", "")).lower()
+    conf_color = "#FF6B6B" if conf == "elite" else "#4ECDC4"
+
+    st.markdown(
+        f"""
+        **{player}** is projected at **{pred:.1f} {market}**, about **{diff:.1f} {market} {below_above}** the **{line:.1f}** line → leaning **{side}**.
+        <span style='background-color:{conf_color}; color:white; padding:2px 8px; border-radius:4px; font-size:0.85em; margin-left:8px;'>
+            {conf.upper()}
+        </span>
+        """,
+        unsafe_allow_html=True
+    )
+
     st.markdown("---")
-    
-    # Top 3 factors with impact visualization
-    factors = [
-        (pick_row.get('factor_1_explanation'), pick_row.get('factor_1_impact')),
-        (pick_row.get('factor_2_explanation'), pick_row.get('factor_2_impact')),
-        (pick_row.get('factor_3_explanation'), pick_row.get('factor_3_impact')),
+    st.markdown("### 🧠 What's driving the projection")
+
+    raw_factors = [
+        pick_row.get("factor_1_explanation"),
+        pick_row.get("factor_2_explanation"),
+        pick_row.get("factor_3_explanation"),
     ]
+
+    # Calculate max impact for better bar scaling
+    impacts = []
+    for exp in raw_factors:
+        parsed = parse_factor(exp)
+        if parsed and parsed[3] is not None:
+            impacts.append(abs(parsed[3]))
     
-    has_factors = False
-    for i, (exp, impact) in enumerate(factors, 1):
-        if pd.notna(exp) and pd.notna(impact):
-            has_factors = True
-            # Color code by impact direction
-            color = "green" if impact > 0 else "red"
-            impact_text = f"{impact:+.2f}"
-            
-            # Impact bar visualization
-            abs_impact = abs(impact)
-            max_width = 100
-            bar_width = min(abs_impact / 2 * max_width, max_width)  # Scale for visualization
-            
-            st.markdown(f"**Factor {i}:** {exp}")
-            st.markdown(
-                f'<div style="background-color: {color}; width: {bar_width}%; '
-                f'height: 20px; border-radius: 5px; display: inline-block;"></div> '
-                f'<span style="margin-left: 10px; font-weight: bold;">{impact_text}</span>',
-                unsafe_allow_html=True
-            )
-            st.markdown("")  # Spacing
-    
-    if not has_factors:
-        st.warning("Factor details not available for this pick")
+    scale = max(impacts) if impacts else 1.0
+
+    any_shown = False
+    for i, exp in enumerate(raw_factors, 1):
+        parsed = parse_factor(exp)
+        if not parsed:
+            continue
+
+        feature, value, _, impact = parsed
+        if feature is None or impact is None:
+            continue
+
+        value_disp = format_feature_value(feature, value)
+        sentence = human_sentence(market, feature, value_disp, impact)
+
+        emoji = "📈" if impact > 0 else "📉"
+        
+        # Scale bars relative to max impact for better visual hierarchy
+        bar_width = (abs(impact) / scale) * 100
+        color = "green" if impact > 0 else "red"
+
+        st.markdown(f"{emoji} **{i}.** {sentence}")
+        st.markdown(
+            f"<div style='background-color:{color}; width:{bar_width:.0f}%; height:14px; border-radius:6px; margin:4px 0;'></div>",
+            unsafe_allow_html=True
+        )
+        st.caption(f"Impact on {market}: {impact:+.2f}")
+        st.markdown("")
+        any_shown = True
+
+    if not any_shown:
+        st.warning("Factor details not available for this pick.")
+
+    st.markdown("---")
+    st.caption("💡 **Green** pushes the prediction up • **Red** pushes it down • Wider bars = stronger effect")
+
+# ============================================================
+# DISPLAY HELPER FUNCTIONS
+# ============================================================
 
 def format_picks_table(df):
     """Format picks dataframe for display"""
@@ -353,25 +505,39 @@ def main():
     with tab1:
         st.header("Today's Picks")
         
-        # Single query loads picks + explanations
+        # Single query loads picks + explanations (both AM and PM if they exist)
         today = load_todays_picks_with_explanations()
 
         if today.empty:
             st.info("🕐 No picks available yet. Check back closer to game time!")
         else:
+            # Check if we have multiple run types
+            run_types = today['run_type'].unique()
+            
+            if len(run_types) > 1:
+                # Filter selector for AM vs PM
+                selected_run = st.radio(
+                    "Select Run:",
+                    options=sorted(run_types, reverse=True),  # PM first
+                    horizontal=True
+                )
+                today_filtered = today[today['run_type'] == selected_run].copy()
+            else:
+                today_filtered = today.copy()
+            
             # Run metadata
-            if 'run_type' in today.columns and pd.notna(today['run_type'].iloc[0]):
-                run_type = today['run_type'].iloc[0]
-                run_time = pd.to_datetime(today['as_of_ts'].iloc[0])
+            if 'run_type' in today_filtered.columns and pd.notna(today_filtered['run_type'].iloc[0]):
+                run_type = today_filtered['run_type'].iloc[0]
+                run_time = pd.to_datetime(today_filtered['as_of_ts'].iloc[0])
                 st.info(f"📊 **{run_type} Run** | Generated at {run_time.strftime('%I:%M %p ET')}")
             
             # Quick stats
             col1, col2, col3, col4 = st.columns(4)
             
-            elite_count = len(today[today['confidence'] == 'elite'])
-            high_count = len(today[today['confidence'] == 'high'])
-            total_units = today['bet_units'].sum()
-            graded = today[today['actual_outcome'].notna()]
+            elite_count = len(today_filtered[today_filtered['confidence'] == 'elite'])
+            high_count = len(today_filtered[today_filtered['confidence'] == 'high'])
+            total_units = today_filtered['bet_units'].sum()
+            graded = today_filtered[today_filtered['actual_outcome'].notna()]
             
             col1.metric("Elite (3u)", elite_count)
             col2.metric("High (2u)", high_count)
@@ -386,13 +552,13 @@ def main():
             st.markdown("---")
             
             # Format and display picks table
-            display = format_picks_table(today)
+            display = format_picks_table(today_filtered)
             
             show_cols = ["Player", "Team", "Market", "Side", "Line", "Pred", 
                         "Ratio", "Mins", "Conf", "Units", "Status"]
             
             st.dataframe(
-                display[show_cols].style.apply(lambda row: highlight_confidence(row, today), axis=1),
+                display[show_cols].style.apply(lambda row: highlight_confidence(row, today_filtered), axis=1),
                 width="stretch",
                 hide_index=True,
                 height=400
@@ -404,12 +570,12 @@ def main():
             st.caption("Select a pick to see why the model made this prediction")
             
             # Count how many picks have explanations
-            has_explanation = today['summary'].notna().sum()
-            st.caption(f"✅ {has_explanation}/{len(today)} picks have explanations")
+            has_explanation = today_filtered['summary'].notna().sum()
+            st.caption(f"✅ {has_explanation}/{len(today_filtered)} picks have explanations")
             
             # Create selection dropdown
             pick_options = []
-            for idx, row in today.iterrows():
+            for idx, row in today_filtered.iterrows():
                 label = f"{row['player_name']} - {row['market'].upper()} {row['side'].upper()} {row['line_use']}"
                 pick_options.append((label, idx))
             
@@ -423,7 +589,7 @@ def main():
                 
                 # Get the selected pick's data (instant, no query needed)
                 selected_idx = [idx for label, idx in pick_options if label == selected_label][0]
-                selected_pick = today.loc[selected_idx]
+                selected_pick = today_filtered.loc[selected_idx]
                 
                 col1, col2 = st.columns([2, 1])
                 
@@ -447,7 +613,7 @@ def main():
             
             # Download button
             st.markdown("---")
-            csv = today.to_csv(index=False)
+            csv = today_filtered.to_csv(index=False)
             st.download_button(
                 "📥 Download Today's Picks (CSV)",
                 csv,
