@@ -50,31 +50,69 @@ bq_client = get_bq_client()
 
 @st.cache_data(ttl=300)  # Refresh every 5 min
 def load_todays_picks():
+    """Load today's elite/high picks with run metadata"""
     query = f"""
+    WITH latest_run AS (
+        SELECT run_id, run_type, as_of_ts
+        FROM `{PROJECT_ID}.{BQ_DATASET}.picks_fact_over_under_graded`
+        WHERE DATE(game_date) = CURRENT_DATE('{BQ_TZ}')
+        ORDER BY as_of_ts DESC
+        LIMIT 1
+    )
     SELECT 
-        player_name,
-        team_name,
-        market,
-        side,
-        line_use,
-        pred_use,
-        ROUND(pred_use / NULLIF(line_use, 0), 3) AS ratio,
-        PRED_minutes,
-        confidence,
-        bet_units,
-        grade,
-        actual_outcome,
-        hit_flag,
-        roi
-    FROM `{PROJECT_ID}.{BQ_DATASET}.picks_fact_over_under_graded`
-    WHERE DATE(game_date) = CURRENT_DATE('{BQ_TZ}')
-      AND confidence IN ('elite', 'high')
-    ORDER BY bet_units DESC, ratio ASC
+        p.run_id,
+        p.run_type,
+        p.as_of_ts,
+        p.player_name,
+        p.team_name,
+        p.market,
+        p.side,
+        p.line_use,
+        p.pred_use,
+        p.odds_snapshot_time,
+        ROUND(p.pred_use / NULLIF(p.line_use, 0), 3) AS ratio,
+        p.PRED_minutes,
+        p.confidence,
+        p.bet_units,
+        p.grade,
+        p.actual_outcome,
+        p.hit_flag,
+        p.roi,
+        p.game_id,
+        p.player_id
+    FROM `{PROJECT_ID}.{BQ_DATASET}.picks_fact_over_under_graded` p
+    INNER JOIN latest_run lr ON p.run_id = lr.run_id
+    WHERE p.confidence IN ('elite', 'high')
+    ORDER BY p.bet_units DESC, ratio ASC
     """
     return bq_client.query(query).to_dataframe()
 
+@st.cache_data(ttl=300)
+def load_pick_explanations(game_id, player_id, market):
+    """Load SHAP explanations for a specific pick"""
+    query = f"""
+    SELECT 
+        summary,
+        factor_1_explanation,
+        factor_1_impact,
+        factor_2_explanation,
+        factor_2_impact,
+        factor_3_explanation,
+        factor_3_impact,
+        full_explanation_json
+    FROM `{PROJECT_ID}.{BQ_DATASET}.pick_explanations`
+    WHERE game_date = CURRENT_DATE('{BQ_TZ}')
+      AND game_id = {game_id}
+      AND player_id = {player_id}
+      AND market = '{market}'
+    LIMIT 1
+    """
+    df = bq_client.query(query).to_dataframe()
+    return df.iloc[0] if not df.empty else None
+
 @st.cache_data(ttl=3600)
 def load_daily_performance(days):
+    """Load daily performance summary"""
     query = f"""
     SELECT
         DATE(game_date) AS date,
@@ -92,12 +130,40 @@ def load_daily_performance(days):
       AND actual_outcome IS NOT NULL
       AND confidence IN ('elite','high')
     GROUP BY date
-    ORDER BY date
+    ORDER BY date DESC
+    """
+    return bq_client.query(query).to_dataframe()
+
+@st.cache_data(ttl=3600)
+def load_picks_for_date(selected_date):
+    """Load all picks for a specific date"""
+    query = f"""
+    SELECT 
+        player_name,
+        team_name,
+        market,
+        side,
+        line_use,
+        pred_use,
+        ROUND(pred_use / NULLIF(line_use, 0), 3) AS ratio,
+        PRED_minutes,
+        confidence,
+        bet_units,
+        actual_outcome,
+        hit_flag,
+        roi,
+        run_type,
+        as_of_ts
+    FROM `{PROJECT_ID}.{BQ_DATASET}.picks_fact_over_under_graded`
+    WHERE DATE(game_date) = DATE('{selected_date}')
+      AND confidence IN ('elite', 'high')
+    ORDER BY bet_units DESC, ratio ASC
     """
     return bq_client.query(query).to_dataframe()
 
 @st.cache_data(ttl=3600)
 def load_market_performance(days):
+    """Load performance by market and confidence"""
     query = f"""
     SELECT
         market,
@@ -121,7 +187,33 @@ def load_market_performance(days):
     return bq_client.query(query).to_dataframe()
 
 @st.cache_data(ttl=3600)
+def load_run_type_performance(days):
+    """Load performance by run type (AM vs PM)"""
+    query = f"""
+    SELECT
+        run_type,
+        COUNT(*) AS picks,
+        SUM(hit_flag) AS wins,
+        ROUND(AVG(hit_flag), 3) AS win_rate,
+        SUM(
+            CASE confidence
+                WHEN 'elite' THEN 3 * roi
+                WHEN 'high' THEN 2 * roi
+            END
+        ) AS profit_units
+    FROM `{PROJECT_ID}.{BQ_DATASET}.picks_fact_over_under_graded`
+    WHERE DATE(game_date) >= DATE_SUB(CURRENT_DATE('{BQ_TZ}'), INTERVAL {days} DAY)
+      AND actual_outcome IS NOT NULL
+      AND confidence IN ('elite','high')
+      AND run_type IS NOT NULL
+    GROUP BY run_type
+    ORDER BY run_type
+    """
+    return bq_client.query(query).to_dataframe()
+
+@st.cache_data(ttl=3600)
 def load_summary_stats(days):
+    """Load overall summary statistics"""
     query = f"""
     SELECT
         COUNT(*) AS total_picks,
@@ -142,12 +234,93 @@ def load_summary_stats(days):
     return df.iloc[0] if not df.empty else None
 
 # ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+
+def display_shap_explanation(explanation):
+    """Display SHAP explanation in a nice format"""
+    if explanation is None:
+        st.info("No explanation available for this pick")
+        return
+    
+    st.markdown("### 🔍 Why This Pick?")
+    
+    # Summary
+    st.markdown(f"**{explanation['summary']}**")
+    
+    st.markdown("---")
+    
+    # Top 3 factors with impact visualization
+    factors = [
+        (explanation['factor_1_explanation'], explanation['factor_1_impact']),
+        (explanation['factor_2_explanation'], explanation['factor_2_impact']),
+        (explanation['factor_3_explanation'], explanation['factor_3_impact']),
+    ]
+    
+    for i, (exp, impact) in enumerate(factors, 1):
+        if pd.notna(exp) and pd.notna(impact):
+            # Color code by impact direction
+            color = "green" if impact > 0 else "red"
+            impact_text = f"{impact:+.2f}"
+            
+            # Impact bar visualization
+            abs_impact = abs(impact)
+            max_width = 100
+            bar_width = min(abs_impact / 2 * max_width, max_width)  # Scale for visualization
+            
+            st.markdown(f"**Factor {i}:** {exp}")
+            st.markdown(
+                f'<div style="background-color: {color}; width: {bar_width}%; '
+                f'height: 20px; border-radius: 5px; display: inline-block;"></div> '
+                f'<span style="margin-left: 10px; font-weight: bold;">{impact_text}</span>',
+                unsafe_allow_html=True
+            )
+            st.markdown("")  # Spacing
+
+def format_picks_table(df):
+    """Format picks dataframe for display"""
+    display = df.copy()
+    display["Player"] = display["player_name"]
+    display["Team"] = display["team_name"]
+    display["Market"] = display["market"].str.upper()
+    display["Side"] = display["side"].str.upper()
+    display["Line"] = display["line_use"].round(1)
+    display["Pred"] = display["pred_use"].round(1)
+    display["Ratio"] = display["ratio"].round(3)
+    display["Mins"] = display["PRED_minutes"].round(0).astype(int)
+    display["Conf"] = display["confidence"].str.upper()
+    display["Units"] = display["bet_units"]
+    
+    # Status with actual outcome if available
+    def get_status(row):
+        if pd.notna(row.get('hit_flag')):
+            if row['hit_flag'] == 1:
+                return f"✅ WIN ({row.get('actual_outcome', 'N/A')})"
+            else:
+                return f"❌ LOSS ({row.get('actual_outcome', 'N/A')})"
+        return "⏳ Pending"
+    
+    display["Status"] = display.apply(get_status, axis=1)
+    
+    return display
+
+def highlight_confidence(row, original_df):
+    """Color code rows by confidence level"""
+    idx = row.name
+    conf = original_df.loc[idx, 'confidence']
+    if conf == 'elite':
+        return ['background-color: rgba(255, 107, 107, 0.2)'] * len(row)
+    elif conf == 'high':
+        return ['background-color: rgba(78, 205, 196, 0.2)'] * len(row)
+    return [''] * len(row)
+
+# ============================================================
 # APP
 # ============================================================
 
 def main():
     st.title("🏀 NBA Props Dashboard")
-    st.caption("Elite & High Confidence Picks Only")
+    st.caption("Elite & High Confidence Picks Only | Powered by XGBoost + SHAP")
 
     # ---------------- SIDEBAR ----------------
     with st.sidebar:
@@ -167,6 +340,17 @@ def main():
             # ROI calculation
             roi_pct = (summary['total_profit'] / summary['total_picks']) * 100 if summary['total_picks'] > 0 else 0
             st.metric("ROI", f"{roi_pct:+.1f}%")
+        
+        st.markdown("---")
+        st.header("🔄 Run Type Performance")
+        
+        run_perf = load_run_type_performance(lookback)
+        if not run_perf.empty:
+            for _, row in run_perf.iterrows():
+                with st.expander(f"{row['run_type']} Run"):
+                    st.metric("Picks", int(row['picks']))
+                    st.metric("Win Rate", f"{row['win_rate']:.1%}")
+                    st.metric("Profit", f"{row['profit_units']:+.1f}u")
 
     # ---------------- TABS ----------------
     tab1, tab2, tab3 = st.tabs(["📋 Today's Picks", "📈 Performance Trends", "🎯 Market Breakdown"])
@@ -180,6 +364,12 @@ def main():
         if today.empty:
             st.info("🕐 No picks available yet. Check back closer to game time!")
         else:
+            # Run metadata
+            if 'run_type' in today.columns and pd.notna(today['run_type'].iloc[0]):
+                run_type = today['run_type'].iloc[0]
+                run_time = pd.to_datetime(today['as_of_ts'].iloc[0])
+                st.info(f"📊 **{run_type} Run** | Generated at {run_time.strftime('%I:%M %p ET')}")
+            
             # Quick stats
             col1, col2, col3, col4 = st.columns(4)
             
@@ -200,50 +390,73 @@ def main():
             
             st.markdown("---")
             
-            # Format and display
-            display = today.copy()
-            display["Player"] = display["player_name"]
-            display["Team"] = display["team_name"]
-            display["Market"] = display["market"].str.upper()
-            display["Side"] = display["side"].str.upper()
-            display["Line"] = display["line_use"].round(1)
-            display["Pred"] = display["pred_use"].round(1)
-            display["Ratio"] = display["ratio"].round(3)
-            display["Mins"] = display["PRED_minutes"].round(0).astype(int)
-            display["Conf"] = display["confidence"].str.upper()
-            display["Units"] = display["bet_units"]
-            display["Status"] = display.apply(
-                lambda r: "✅ WIN" if r.hit_flag == 1 
-                         else "❌ LOSS" if r.hit_flag == 0 
-                         else "⏳ Pending",
-                axis=1
-            )
-            
-            # Color code by confidence (FIXED: access original dataframe via index)
-            def highlight_confidence(row):
-                # Use the row's index to get the confidence from original dataframe
-                idx = row.name
-                conf = today.loc[idx, 'confidence']
-                if conf == 'elite':
-                    return ['background-color: rgba(255, 107, 107, 0.2)'] * len(row)
-                elif conf == 'high':
-                    return ['background-color: rgba(78, 205, 196, 0.2)'] * len(row)
-                return [''] * len(row)
+            # Format and display picks table
+            display = format_picks_table(today)
             
             show_cols = ["Player", "Team", "Market", "Side", "Line", "Pred", 
                         "Ratio", "Mins", "Conf", "Units", "Status"]
             
             st.dataframe(
-                display[show_cols].style.apply(highlight_confidence, axis=1),
-                width="stretch",  # FIXED: replaced use_container_width
+                display[show_cols].style.apply(lambda row: highlight_confidence(row, today), axis=1),
+                use_container_width=True,
                 hide_index=True,
                 height=400
             )
             
+            # SHAP Explanations Section
+            st.markdown("---")
+            st.subheader("🧠 Pick Explanations (SHAP Analysis)")
+            st.caption("Select a pick to see why the model made this prediction")
+            
+            # Create selection dropdown
+            pick_options = []
+            for idx, row in today.iterrows():
+                label = f"{row['player_name']} - {row['market'].upper()} {row['side'].upper()} {row['line_use']}"
+                pick_options.append((label, idx))
+            
+            if pick_options:
+                selected_label = st.selectbox(
+                    "Choose a pick to explain:",
+                    options=[label for label, _ in pick_options],
+                    index=0
+                )
+                
+                # Get the selected pick's data
+                selected_idx = [idx for label, idx in pick_options if label == selected_label][0]
+                selected_pick = today.loc[selected_idx]
+                
+                # Load and display explanation
+                with st.spinner("Loading explanation..."):
+                    explanation = load_pick_explanations(
+                        selected_pick['game_id'],
+                        selected_pick['player_id'],
+                        selected_pick['market']
+                    )
+                    
+                    col1, col2 = st.columns([2, 1])
+                    
+                    with col1:
+                        display_shap_explanation(explanation)
+                    
+                    with col2:
+                        st.markdown("### 📊 Pick Details")
+                        st.metric("Player", selected_pick['player_name'])
+                        st.metric("Team", selected_pick['team_name'])
+                        st.metric("Market", selected_pick['market'].upper())
+                        st.metric("Line", f"{selected_pick['side'].upper()} {selected_pick['line_use']}")
+                        st.metric("Prediction", f"{selected_pick['pred_use']:.1f}")
+                        st.metric("Minutes", f"{selected_pick['PRED_minutes']:.0f}")
+                        st.metric("Confidence", selected_pick['confidence'].upper())
+                        
+                        if pd.notna(selected_pick.get('odds_snapshot_time')):
+                            snap_time = pd.to_datetime(selected_pick['odds_snapshot_time'])
+                            st.caption(f"Odds from: {snap_time.strftime('%I:%M %p ET')}")
+            
             # Download button
+            st.markdown("---")
             csv = today.to_csv(index=False)
             st.download_button(
-                "📥 Download CSV",
+                "📥 Download Today's Picks (CSV)",
                 csv,
                 f"nba_picks_{datetime.now().strftime('%Y%m%d')}.csv",
                 "text/csv"
@@ -259,6 +472,7 @@ def main():
             st.warning("No historical data available for selected period")
         else:
             # Calculate cumulative
+            daily = daily.sort_values('date')
             daily["cumulative_profit"] = daily["profit_units"].cumsum()
             
             # Overall metrics
@@ -292,7 +506,7 @@ def main():
                                annotation_text=f"Average ({overall_wr:.1%})")
                 fig_wr.update_yaxes(tickformat=".0%")
                 fig_wr.update_layout(height=400)
-                st.plotly_chart(fig_wr, width="stretch")  # FIXED
+                st.plotly_chart(fig_wr, use_container_width=True)
 
             # Cumulative Profit
             with col2:
@@ -309,20 +523,83 @@ def main():
                 colors = ['green' if x > 0 else 'red' for x in daily['cumulative_profit']]
                 fig_cp.update_traces(line_color='#4ECDC4', marker=dict(color=colors))
                 fig_cp.update_layout(height=400)
-                st.plotly_chart(fig_cp, width="stretch")  # FIXED
+                st.plotly_chart(fig_cp, use_container_width=True)
             
-            # Data table
+            # Interactive Daily Breakdown
             st.markdown("---")
-            st.subheader("Daily Breakdown")
+            st.subheader("📅 Daily Breakdown - Click to View Picks")
             
-            display_daily = daily.copy()
+            # Sort by date descending for the dropdown
+            daily_sorted = daily.sort_values('date', ascending=False)
+            
+            # Create date selection
+            selected_date = st.selectbox(
+                "Select a date to view picks:",
+                options=daily_sorted['date'].dt.strftime('%Y-%m-%d').tolist(),
+                format_func=lambda x: pd.to_datetime(x).strftime('%a, %b %d, %Y')
+            )
+            
+            if selected_date:
+                # Load picks for selected date
+                date_picks = load_picks_for_date(selected_date)
+                
+                if not date_picks.empty:
+                    # Show daily summary
+                    date_stats = daily_sorted[daily_sorted['date'] == pd.to_datetime(selected_date)].iloc[0]
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("Picks", int(date_stats['picks']))
+                    col2.metric("Wins", int(date_stats['wins']))
+                    col3.metric("Win Rate", f"{date_stats['win_rate']:.1%}")
+                    col4.metric("Profit", f"{date_stats['profit_units']:+.1f}u")
+                    
+                    # Show run type info if available
+                    if 'run_type' in date_picks.columns and pd.notna(date_picks['run_type'].iloc[0]):
+                        run_types = date_picks['run_type'].value_counts()
+                        st.info(f"📊 Runs: {', '.join([f'{rt} ({cnt})' for rt, cnt in run_types.items()])}")
+                    
+                    st.markdown("---")
+                    
+                    # Display picks table
+                    display = format_picks_table(date_picks)
+                    
+                    show_cols = ["Player", "Team", "Market", "Side", "Line", "Pred", 
+                                "Ratio", "Mins", "Conf", "Units", "Status"]
+                    
+                    st.dataframe(
+                        display[show_cols].style.apply(
+                            lambda row: highlight_confidence(row, date_picks), axis=1
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                        height=400
+                    )
+                    
+                    # Download button for this date
+                    csv = date_picks.to_csv(index=False)
+                    st.download_button(
+                        f"📥 Download {selected_date} Picks",
+                        csv,
+                        f"nba_picks_{selected_date}.csv",
+                        "text/csv",
+                        key=f"download_{selected_date}"
+                    )
+                else:
+                    st.warning(f"No picks found for {selected_date}")
+            
+            # Summary table
+            st.markdown("---")
+            st.subheader("Summary Table")
+            
+            display_daily = daily_sorted.copy()
+            display_daily['date'] = display_daily['date'].dt.strftime('%Y-%m-%d')
             display_daily['win_rate'] = display_daily['win_rate'].apply(lambda x: f"{x:.1%}")
             display_daily['profit_units'] = display_daily['profit_units'].round(1)
             display_daily['cumulative_profit'] = display_daily['cumulative_profit'].round(1)
             
             st.dataframe(
-                display_daily.sort_values('date', ascending=False),
-                width="stretch",  # FIXED
+                display_daily,
+                use_container_width=True,
                 hide_index=True
             )
 
@@ -363,7 +640,7 @@ def main():
                 yaxis_title="Profit (Units)",
                 height=400
             )
-            st.plotly_chart(fig_mkt, width="stretch")  # FIXED
+            st.plotly_chart(fig_mkt, use_container_width=True)
             
             # Detailed breakdown by confidence
             st.markdown("---")
@@ -378,7 +655,9 @@ def main():
                 if not elite.empty:
                     elite_display = elite[['market', 'picks', 'wins', 'win_rate', 'profit_units']].copy()
                     elite_display['market'] = elite_display['market'].str.upper()
-                    st.dataframe(elite_display, width="stretch", hide_index=True)  # FIXED
+                    elite_display['win_rate'] = elite_display['win_rate'].apply(lambda x: f"{x:.1%}")
+                    elite_display['profit_units'] = elite_display['profit_units'].round(1)
+                    st.dataframe(elite_display, use_container_width=True, hide_index=True)
                 else:
                     st.info("No elite picks in this period")
             
@@ -389,7 +668,9 @@ def main():
                 if not high.empty:
                     high_display = high[['market', 'picks', 'wins', 'win_rate', 'profit_units']].copy()
                     high_display['market'] = high_display['market'].str.upper()
-                    st.dataframe(high_display, width="stretch", hide_index=True)  # FIXED
+                    high_display['win_rate'] = high_display['win_rate'].apply(lambda x: f"{x:.1%}")
+                    high_display['profit_units'] = high_display['profit_units'].round(1)
+                    st.dataframe(high_display, use_container_width=True, hide_index=True)
                 else:
                     st.info("No high picks in this period")
 
