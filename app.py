@@ -88,8 +88,11 @@ def load_todays_picks():
     return bq_client.query(query).to_dataframe()
 
 @st.cache_data(ttl=300)
-def load_pick_explanations(game_id, player_id, market):
-    """Load SHAP explanations for a specific pick"""
+def load_pick_explanations(game_id, player_id, market, run_id):
+    """
+    Load SHAP explanations for a specific pick.
+    Include run_id to handle multiple runs per day (AM/PM).
+    """
     query = f"""
     SELECT 
         summary,
@@ -105,10 +108,15 @@ def load_pick_explanations(game_id, player_id, market):
       AND game_id = {game_id}
       AND player_id = {player_id}
       AND market = '{market}'
+      AND run_id = '{run_id}'
     LIMIT 1
     """
-    df = bq_client.query(query).to_dataframe()
-    return df.iloc[0] if not df.empty else None
+    try:
+        df = bq_client.query(query).to_dataframe()
+        return df.iloc[0] if not df.empty else None
+    except Exception as e:
+        st.error(f"Error loading explanation: {e}")
+        return None
 
 @st.cache_data(ttl=3600)
 def load_daily_performance(days):
@@ -240,25 +248,31 @@ def load_summary_stats(days):
 def display_shap_explanation(explanation):
     """Display SHAP explanation in a nice format"""
     if explanation is None:
-        st.info("No explanation available for this pick")
+        st.info("💡 No explanation available for this pick yet")
+        st.caption("SHAP explanations are generated when you run the prediction script. If you haven't run the updated script yet, older picks won't have explanations.")
         return
     
     st.markdown("### 🔍 Why This Pick?")
     
-    # Summary
-    st.markdown(f"**{explanation['summary']}**")
+    # Summary with error handling
+    if pd.notna(explanation.get('summary')):
+        st.markdown(f"**{explanation['summary']}**")
+    else:
+        st.warning("Summary not available")
     
     st.markdown("---")
     
     # Top 3 factors with impact visualization
     factors = [
-        (explanation['factor_1_explanation'], explanation['factor_1_impact']),
-        (explanation['factor_2_explanation'], explanation['factor_2_impact']),
-        (explanation['factor_3_explanation'], explanation['factor_3_impact']),
+        (explanation.get('factor_1_explanation'), explanation.get('factor_1_impact')),
+        (explanation.get('factor_2_explanation'), explanation.get('factor_2_impact')),
+        (explanation.get('factor_3_explanation'), explanation.get('factor_3_impact')),
     ]
     
+    has_factors = False
     for i, (exp, impact) in enumerate(factors, 1):
         if pd.notna(exp) and pd.notna(impact):
+            has_factors = True
             # Color code by impact direction
             color = "green" if impact > 0 else "red"
             impact_text = f"{impact:+.2f}"
@@ -276,6 +290,9 @@ def display_shap_explanation(explanation):
                 unsafe_allow_html=True
             )
             st.markdown("")  # Spacing
+    
+    if not has_factors:
+        st.warning("Factor details not available for this pick")
 
 def format_picks_table(df):
     """Format picks dataframe for display"""
@@ -418,39 +435,45 @@ def main():
                 selected_label = st.selectbox(
                     "Choose a pick to explain:",
                     options=[label for label, _ in pick_options],
-                    index=0
+                    index=0,
+                    key="pick_selector"
                 )
                 
                 # Get the selected pick's data
                 selected_idx = [idx for label, idx in pick_options if label == selected_label][0]
                 selected_pick = today.loc[selected_idx]
                 
-                # Load and display explanation
-                with st.spinner("Loading explanation..."):
-                    explanation = load_pick_explanations(
-                        selected_pick['game_id'],
-                        selected_pick['player_id'],
-                        selected_pick['market']
-                    )
-                    
-                    col1, col2 = st.columns([2, 1])
-                    
-                    with col1:
-                        display_shap_explanation(explanation)
-                    
-                    with col2:
-                        st.markdown("### 📊 Pick Details")
-                        st.metric("Player", selected_pick['player_name'])
-                        st.metric("Team", selected_pick['team_name'])
-                        st.metric("Market", selected_pick['market'].upper())
-                        st.metric("Line", f"{selected_pick['side'].upper()} {selected_pick['line_use']}")
-                        st.metric("Prediction", f"{selected_pick['pred_use']:.1f}")
-                        st.metric("Minutes", f"{selected_pick['PRED_minutes']:.0f}")
-                        st.metric("Confidence", selected_pick['confidence'].upper())
+                # Load and display explanation with proper error handling
+                try:
+                    with st.spinner("Loading explanation..."):
+                        explanation = load_pick_explanations(
+                            int(selected_pick['game_id']),
+                            int(selected_pick['player_id']),
+                            str(selected_pick['market']),
+                            str(selected_pick['run_id'])
+                        )
                         
-                        if pd.notna(selected_pick.get('odds_snapshot_time')):
-                            snap_time = pd.to_datetime(selected_pick['odds_snapshot_time'])
-                            st.caption(f"Odds from: {snap_time.strftime('%I:%M %p ET')}")
+                        col1, col2 = st.columns([2, 1])
+                        
+                        with col1:
+                            display_shap_explanation(explanation)
+                        
+                        with col2:
+                            st.markdown("### 📊 Pick Details")
+                            st.metric("Player", selected_pick['player_name'])
+                            st.metric("Team", selected_pick['team_name'])
+                            st.metric("Market", selected_pick['market'].upper())
+                            st.metric("Line", f"{selected_pick['side'].upper()} {selected_pick['line_use']}")
+                            st.metric("Prediction", f"{selected_pick['pred_use']:.1f}")
+                            st.metric("Minutes", f"{selected_pick['PRED_minutes']:.0f}")
+                            st.metric("Confidence", selected_pick['confidence'].upper())
+                            
+                            if pd.notna(selected_pick.get('odds_snapshot_time')):
+                                snap_time = pd.to_datetime(selected_pick['odds_snapshot_time'])
+                                st.caption(f"Odds from: {snap_time.strftime('%I:%M %p ET')}")
+                except Exception as e:
+                    st.error(f"⚠️ Error loading explanation: {str(e)}")
+                    st.info("This pick may not have SHAP data yet. Run the prediction script with SHAP enabled.")
             
             # Download button
             st.markdown("---")
