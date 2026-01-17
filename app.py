@@ -48,9 +48,12 @@ bq_client = get_bq_client()
 # DATA LOADERS
 # ============================================================
 
-@st.cache_data(ttl=300)  # Refresh every 5 min
-def load_todays_picks():
-    """Load today's elite/high picks with run metadata"""
+@st.cache_data(ttl=900)  # 15 min - longer cache to reduce rerun query load
+def load_todays_picks_with_explanations():
+    """
+    Single query that loads today's picks WITH explanations joined.
+    This eliminates the "multiple queries on rerun" problem.
+    """
     query = f"""
     WITH latest_run AS (
         SELECT run_id, run_type, as_of_ts
@@ -59,64 +62,37 @@ def load_todays_picks():
         ORDER BY as_of_ts DESC
         LIMIT 1
     )
-    SELECT 
-        p.run_id,
-        p.run_type,
-        p.as_of_ts,
-        p.player_name,
-        p.team_name,
-        p.market,
-        p.side,
-        p.line_use,
-        p.pred_use,
-        p.odds_snapshot_time,
+    SELECT
+        p.run_id, p.run_type, p.as_of_ts,
+        p.player_name, p.team_name, p.market, p.side,
+        p.line_use, p.pred_use, p.odds_snapshot_time,
         ROUND(p.pred_use / NULLIF(p.line_use, 0), 3) AS ratio,
-        p.PRED_minutes,
-        p.confidence,
-        p.bet_units,
-        p.grade,
-        p.actual_outcome,
-        p.hit_flag,
-        p.roi,
-        p.game_id,
-        p.player_id
+        p.PRED_minutes, p.confidence, p.bet_units, p.grade,
+        p.actual_outcome, p.hit_flag, p.roi, p.game_id, p.player_id,
+
+        e.summary,
+        e.factor_1_explanation, e.factor_1_impact,
+        e.factor_2_explanation, e.factor_2_impact,
+        e.factor_3_explanation, e.factor_3_impact,
+        e.full_explanation_json
+
     FROM `{PROJECT_ID}.{BQ_DATASET}.picks_fact_over_under_graded` p
     INNER JOIN latest_run lr ON p.run_id = lr.run_id
+    LEFT JOIN `{PROJECT_ID}.{BQ_DATASET}.pick_explanations` e
+        ON e.game_date = CURRENT_DATE('{BQ_TZ}')
+        AND e.run_id = p.run_id
+        AND e.game_id = p.game_id
+        AND e.player_id = p.player_id
+        AND e.market = p.market
     WHERE p.confidence IN ('elite', 'high')
     ORDER BY p.bet_units DESC, ratio ASC
     """
-    return bq_client.query(query).to_dataframe()
-
-@st.cache_data(ttl=300)
-def load_pick_explanations(game_id, player_id, market, run_id):
-    """
-    Load SHAP explanations for a specific pick.
-    Include run_id to handle multiple runs per day (AM/PM).
-    """
-    query = f"""
-    SELECT 
-        summary,
-        factor_1_explanation,
-        factor_1_impact,
-        factor_2_explanation,
-        factor_2_impact,
-        factor_3_explanation,
-        factor_3_impact,
-        full_explanation_json
-    FROM `{PROJECT_ID}.{BQ_DATASET}.pick_explanations`
-    WHERE game_date = CURRENT_DATE('{BQ_TZ}')
-      AND game_id = {game_id}
-      AND player_id = {player_id}
-      AND market = '{market}'
-      AND run_id = '{run_id}'
-    LIMIT 1
-    """
-    try:
-        df = bq_client.query(query).to_dataframe()
-        return df.iloc[0] if not df.empty else None
-    except Exception as e:
-        st.error(f"Error loading explanation: {e}")
-        return None
+    df = bq_client.query(query).to_dataframe()
+    
+    # Deduplicate to prevent duplicate row issues
+    df = df.drop_duplicates(subset=['run_id', 'game_id', 'player_id', 'market', 'side']).reset_index(drop=True)
+    
+    return df
 
 @st.cache_data(ttl=3600)
 def load_daily_performance(days):
@@ -245,28 +221,29 @@ def load_summary_stats(days):
 # HELPER FUNCTIONS
 # ============================================================
 
-def display_shap_explanation(explanation):
-    """Display SHAP explanation in a nice format"""
-    if explanation is None:
+def display_shap_explanation(pick_row):
+    """
+    Display SHAP explanation directly from the pick row.
+    No lookup needed - explanations are already joined in the data.
+    """
+    # Check if explanation data exists
+    if pd.isna(pick_row.get('summary')):
         st.info("💡 No explanation available for this pick yet")
         st.caption("SHAP explanations are generated when you run the prediction script. If you haven't run the updated script yet, older picks won't have explanations.")
         return
     
     st.markdown("### 🔍 Why This Pick?")
     
-    # Summary with error handling
-    if pd.notna(explanation.get('summary')):
-        st.markdown(f"**{explanation['summary']}**")
-    else:
-        st.warning("Summary not available")
+    # Summary
+    st.markdown(f"**{pick_row['summary']}**")
     
     st.markdown("---")
     
     # Top 3 factors with impact visualization
     factors = [
-        (explanation.get('factor_1_explanation'), explanation.get('factor_1_impact')),
-        (explanation.get('factor_2_explanation'), explanation.get('factor_2_impact')),
-        (explanation.get('factor_3_explanation'), explanation.get('factor_3_impact')),
+        (pick_row.get('factor_1_explanation'), pick_row.get('factor_1_impact')),
+        (pick_row.get('factor_2_explanation'), pick_row.get('factor_2_impact')),
+        (pick_row.get('factor_3_explanation'), pick_row.get('factor_3_impact')),
     ]
     
     has_factors = False
@@ -376,7 +353,8 @@ def main():
     with tab1:
         st.header("Today's Picks")
         
-        today = load_todays_picks()
+        # Single query loads picks + explanations
+        today = load_todays_picks_with_explanations()
 
         if today.empty:
             st.info("🕐 No picks available yet. Check back closer to game time!")
@@ -425,6 +403,10 @@ def main():
             st.subheader("🧠 Pick Explanations (SHAP Analysis)")
             st.caption("Select a pick to see why the model made this prediction")
             
+            # Count how many picks have explanations
+            has_explanation = today['summary'].notna().sum()
+            st.caption(f"✅ {has_explanation}/{len(today)} picks have explanations")
+            
             # Create selection dropdown
             pick_options = []
             for idx, row in today.iterrows():
@@ -439,41 +421,29 @@ def main():
                     key="pick_selector"
                 )
                 
-                # Get the selected pick's data
+                # Get the selected pick's data (instant, no query needed)
                 selected_idx = [idx for label, idx in pick_options if label == selected_label][0]
                 selected_pick = today.loc[selected_idx]
                 
-                # Load and display explanation with proper error handling
-                try:
-                    with st.spinner("Loading explanation..."):
-                        explanation = load_pick_explanations(
-                            int(selected_pick['game_id']),
-                            int(selected_pick['player_id']),
-                            str(selected_pick['market']),
-                            str(selected_pick['run_id'])
-                        )
-                        
-                        col1, col2 = st.columns([2, 1])
-                        
-                        with col1:
-                            display_shap_explanation(explanation)
-                        
-                        with col2:
-                            st.markdown("### 📊 Pick Details")
-                            st.metric("Player", selected_pick['player_name'])
-                            st.metric("Team", selected_pick['team_name'])
-                            st.metric("Market", selected_pick['market'].upper())
-                            st.metric("Line", f"{selected_pick['side'].upper()} {selected_pick['line_use']}")
-                            st.metric("Prediction", f"{selected_pick['pred_use']:.1f}")
-                            st.metric("Minutes", f"{selected_pick['PRED_minutes']:.0f}")
-                            st.metric("Confidence", selected_pick['confidence'].upper())
-                            
-                            if pd.notna(selected_pick.get('odds_snapshot_time')):
-                                snap_time = pd.to_datetime(selected_pick['odds_snapshot_time'])
-                                st.caption(f"Odds from: {snap_time.strftime('%I:%M %p ET')}")
-                except Exception as e:
-                    st.error(f"⚠️ Error loading explanation: {str(e)}")
-                    st.info("This pick may not have SHAP data yet. Run the prediction script with SHAP enabled.")
+                col1, col2 = st.columns([2, 1])
+                
+                with col1:
+                    # Display explanation directly from the row data
+                    display_shap_explanation(selected_pick)
+                
+                with col2:
+                    st.markdown("### 📊 Pick Details")
+                    st.metric("Player", selected_pick['player_name'])
+                    st.metric("Team", selected_pick['team_name'])
+                    st.metric("Market", selected_pick['market'].upper())
+                    st.metric("Line", f"{selected_pick['side'].upper()} {selected_pick['line_use']}")
+                    st.metric("Prediction", f"{selected_pick['pred_use']:.1f}")
+                    st.metric("Minutes", f"{selected_pick['PRED_minutes']:.0f}")
+                    st.metric("Confidence", selected_pick['confidence'].upper())
+                    
+                    if pd.notna(selected_pick.get('odds_snapshot_time')):
+                        snap_time = pd.to_datetime(selected_pick['odds_snapshot_time'])
+                        st.caption(f"Odds from: {snap_time.strftime('%I:%M %p ET')}")
             
             # Download button
             st.markdown("---")
