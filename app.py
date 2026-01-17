@@ -398,7 +398,7 @@ def main():
             
             st.dataframe(
                 display[show_cols].style.apply(lambda row: highlight_confidence(row, today), axis=1),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 height=400
             )
@@ -506,7 +506,7 @@ def main():
                                annotation_text=f"Average ({overall_wr:.1%})")
                 fig_wr.update_yaxes(tickformat=".0%")
                 fig_wr.update_layout(height=400)
-                st.plotly_chart(fig_wr, use_container_width=True)
+                st.plotly_chart(fig_wr, width="stretch")
 
             # Cumulative Profit
             with col2:
@@ -523,7 +523,7 @@ def main():
                 colors = ['green' if x > 0 else 'red' for x in daily['cumulative_profit']]
                 fig_cp.update_traces(line_color='#4ECDC4', marker=dict(color=colors))
                 fig_cp.update_layout(height=400)
-                st.plotly_chart(fig_cp, use_container_width=True)
+                st.plotly_chart(fig_cp, width="stretch")
             
             # Interactive Daily Breakdown
             st.markdown("---")
@@ -531,6 +531,10 @@ def main():
             
             # Sort by date descending for the dropdown
             daily_sorted = daily.sort_values('date', ascending=False)
+            
+            # Ensure date column is datetime type
+            if not pd.api.types.is_datetime64_any_dtype(daily_sorted['date']):
+                daily_sorted['date'] = pd.to_datetime(daily_sorted['date'])
             
             # Create date selection
             selected_date = st.selectbox(
@@ -570,7 +574,7 @@ def main():
                         display[show_cols].style.apply(
                             lambda row: highlight_confidence(row, date_picks), axis=1
                         ),
-                        use_container_width=True,
+                        width="stretch",
                         hide_index=True,
                         height=400
                     )
@@ -599,7 +603,7 @@ def main():
             
             st.dataframe(
                 display_daily,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
 
@@ -640,7 +644,7 @@ def main():
                 yaxis_title="Profit (Units)",
                 height=400
             )
-            st.plotly_chart(fig_mkt, use_container_width=True)
+            st.plotly_chart(fig_mkt, width="stretch")
             
             # Detailed breakdown by confidence
             st.markdown("---")
@@ -657,7 +661,7 @@ def main():
                     elite_display['market'] = elite_display['market'].str.upper()
                     elite_display['win_rate'] = elite_display['win_rate'].apply(lambda x: f"{x:.1%}")
                     elite_display['profit_units'] = elite_display['profit_units'].round(1)
-                    st.dataframe(elite_display, use_container_width=True, hide_index=True)
+                    st.dataframe(elite_display, width="stretch", hide_index=True)
                 else:
                     st.info("No elite picks in this period")
             
@@ -670,7 +674,7 @@ def main():
                     high_display['market'] = high_display['market'].str.upper()
                     high_display['win_rate'] = high_display['win_rate'].apply(lambda x: f"{x:.1%}")
                     high_display['profit_units'] = high_display['profit_units'].round(1)
-                    st.dataframe(high_display, use_container_width=True, hide_index=True)
+                    st.dataframe(high_display, width="stretch", hide_index=True)
                 else:
                     st.info("No high picks in this period")
 
