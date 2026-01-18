@@ -482,11 +482,11 @@ def main():
             else:
                 today_filtered = today.copy()
 
-            # Run metadata (now timezone-aware)
+            # Run metadata (timezone-aware conversion only)
             if 'run_type' in today_filtered.columns and pd.notna(today_filtered['run_type'].iloc[0]):
                 run_type = today_filtered['run_type'].iloc[0]
                 run_time = pd.to_datetime(today_filtered['as_of_ts'].iloc[0])
-                run_time = run_time.tz_localize('UTC').tz_convert('America/New_York')
+                run_time = run_time.tz_convert('America/New_York')
                 st.info(f"📊 **{run_type} Run** | Generated at {run_time.strftime('%I:%M %p ET')}")
 
             col1, col2, col3, col4 = st.columns(4)
