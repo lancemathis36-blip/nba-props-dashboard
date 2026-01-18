@@ -67,7 +67,6 @@ def load_todays_picks_with_explanations():
           AND run_type IN ('AM', 'PM')
         GROUP BY run_type
     ),
-    -- Deduplicate picks by logical identity
     deduped_picks AS (
         SELECT 
             p.*,
@@ -94,13 +93,11 @@ def load_todays_picks_with_explanations():
         ROUND(p.pred_use / NULLIF(p.line_use, 0), 3) AS ratio,
         p.PRED_minutes, p.confidence, p.bet_units, p.grade,
         p.actual_outcome, p.hit_flag, p.roi, p.game_id, p.player_id,
-
         e.summary,
         e.factor_1_explanation, e.factor_1_impact,
         e.factor_2_explanation, e.factor_2_impact,
         e.factor_3_explanation, e.factor_3_impact,
         e.full_explanation_json
-
     FROM deduped_picks p
     LEFT JOIN `{PROJECT_ID}.{BQ_DATASET}.pick_explanations` e
         ON e.game_date = CURRENT_DATE('{BQ_TZ}')
@@ -108,16 +105,11 @@ def load_todays_picks_with_explanations():
         AND e.game_id = p.game_id
         AND e.player_id = p.player_id
         AND e.market = p.market
-    WHERE p.rn = 1  -- Only keep first occurrence
+    WHERE p.rn = 1
     ORDER BY p.run_type DESC, p.bet_units DESC, ratio ASC
     """
     df = bq_client.query(query).to_dataframe()
-    
-    # Extra safety: dedupe in Python (defensive)
-    df = df.drop_duplicates(
-        subset=['run_id', 'game_id', 'player_id', 'market', 'side']
-    ).reset_index(drop=True)
-    
+    df = df.drop_duplicates(subset=['run_id', 'game_id', 'player_id', 'market', 'side']).reset_index(drop=True)
     return df
 
 @st.cache_data(ttl=3600)
@@ -369,7 +361,6 @@ def display_shap_explanation(pick_row):
     )
     st.markdown("---")
     st.markdown("### 🧠 What's driving the projection")
-
     raw_factors = [
         pick_row.get("factor_1_explanation"),
         pick_row.get("factor_2_explanation"),
@@ -402,10 +393,8 @@ def display_shap_explanation(pick_row):
         st.caption(f"Impact on {market}: {impact:+.2f}")
         st.markdown("")
         any_shown = True
-
     if not any_shown:
         st.warning("Factor details not available for this pick.")
-
     st.markdown("---")
     st.caption("💡 **Green** pushes the prediction up • **Red** pushes it down • Wider bars = stronger effect")
 
@@ -493,9 +482,11 @@ def main():
             else:
                 today_filtered = today.copy()
 
+            # Run metadata (now timezone-aware)
             if 'run_type' in today_filtered.columns and pd.notna(today_filtered['run_type'].iloc[0]):
                 run_type = today_filtered['run_type'].iloc[0]
                 run_time = pd.to_datetime(today_filtered['as_of_ts'].iloc[0])
+                run_time = run_time.tz_localize('UTC').tz_convert('America/New_York')
                 st.info(f"📊 **{run_type} Run** | Generated at {run_time.strftime('%I:%M %p ET')}")
 
             col1, col2, col3, col4 = st.columns(4)
@@ -528,7 +519,6 @@ def main():
             st.caption("Select a pick to see why the model made this prediction")
             has_explanation = today_filtered['summary'].notna().sum()
             st.caption(f"✅ {has_explanation}/{len(today_filtered)} picks have explanations")
-
             pick_options = []
             for idx, row in today_filtered.iterrows():
                 label = f"{row['player_name']} - {row['market'].upper()} {row['side'].upper()} {row['line_use']}"
@@ -557,7 +547,6 @@ def main():
                     if pd.notna(selected_pick.get('odds_snapshot_time')):
                         snap_time = pd.to_datetime(selected_pick['odds_snapshot_time'])
                         st.caption(f"Odds from: {snap_time.strftime('%I:%M %p ET')}")
-
             st.markdown("---")
             csv = today_filtered.to_csv(index=False)
             st.download_button(
