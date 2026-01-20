@@ -115,6 +115,25 @@ def load_todays_picks_with_explanations():
 @st.cache_data(ttl=3600)
 def load_daily_performance(days):
     query = f"""
+    WITH deduped AS (
+        SELECT 
+            *,
+            ROW_NUMBER() OVER (
+                PARTITION BY 
+                    DATE(game_date),
+                    game_id,
+                    player_id,
+                    market,
+                    side
+                ORDER BY 
+                    CASE run_type WHEN 'AM' THEN 1 WHEN 'PM' THEN 2 ELSE 3 END,
+                    COALESCE(as_of_ts, TIMESTAMP('1970-01-01')) DESC
+            ) as rn
+        FROM `{PROJECT_ID}.{BQ_DATASET}.picks_fact_over_under_graded`
+        WHERE DATE(game_date) >= DATE_SUB(CURRENT_DATE('{BQ_TZ}'), INTERVAL {days} DAY)
+          AND actual_outcome IS NOT NULL
+          AND confidence IN ('elite','high')
+    )
     SELECT
         DATE(game_date) AS date,
         COUNT(*) AS picks,
@@ -126,10 +145,8 @@ def load_daily_performance(days):
                 WHEN 'high' THEN 2 * roi
             END
         ) AS profit_units
-    FROM `{PROJECT_ID}.{BQ_DATASET}.picks_fact_over_under_graded`
-    WHERE DATE(game_date) >= DATE_SUB(CURRENT_DATE('{BQ_TZ}'), INTERVAL {days} DAY)
-      AND actual_outcome IS NOT NULL
-      AND confidence IN ('elite','high')
+    FROM deduped
+    WHERE rn = 1
     GROUP BY date
     ORDER BY date DESC
     """
@@ -137,7 +154,7 @@ def load_daily_performance(days):
 
 @st.cache_data(ttl=3600)
 def load_picks_for_date(selected_date):
-    """Load all picks for a specific date, deduplicated"""
+    """Load all picks for a specific date, deduplicated with AM priority"""
     query = f"""
     WITH deduped AS (
         SELECT 
@@ -149,7 +166,9 @@ def load_picks_for_date(selected_date):
                     player_id,
                     market,
                     side
-                ORDER BY COALESCE(as_of_ts, TIMESTAMP('1970-01-01')) ASC
+                ORDER BY 
+                    CASE run_type WHEN 'AM' THEN 1 WHEN 'PM' THEN 2 ELSE 3 END,
+                    COALESCE(as_of_ts, TIMESTAMP('1970-01-01')) DESC
             ) as rn
         FROM `{PROJECT_ID}.{BQ_DATASET}.picks_fact_over_under_graded`
         WHERE DATE(game_date) = DATE('{selected_date}')
@@ -180,6 +199,25 @@ def load_picks_for_date(selected_date):
 @st.cache_data(ttl=3600)
 def load_market_performance(days):
     query = f"""
+    WITH deduped AS (
+        SELECT 
+            *,
+            ROW_NUMBER() OVER (
+                PARTITION BY 
+                    DATE(game_date),
+                    game_id,
+                    player_id,
+                    market,
+                    side
+                ORDER BY 
+                    CASE run_type WHEN 'AM' THEN 1 WHEN 'PM' THEN 2 ELSE 3 END,
+                    COALESCE(as_of_ts, TIMESTAMP('1970-01-01')) DESC
+            ) as rn
+        FROM `{PROJECT_ID}.{BQ_DATASET}.picks_fact_over_under_graded`
+        WHERE DATE(game_date) >= DATE_SUB(CURRENT_DATE('{BQ_TZ}'), INTERVAL {days} DAY)
+          AND actual_outcome IS NOT NULL
+          AND confidence IN ('elite','high')
+    )
     SELECT
         market,
         confidence,
@@ -193,10 +231,8 @@ def load_market_performance(days):
                 WHEN 'high' THEN 2 * roi
             END
         ) AS profit_units
-    FROM `{PROJECT_ID}.{BQ_DATASET}.picks_fact_over_under_graded`
-    WHERE DATE(game_date) >= DATE_SUB(CURRENT_DATE('{BQ_TZ}'), INTERVAL {days} DAY)
-      AND actual_outcome IS NOT NULL
-      AND confidence IN ('elite','high')
+    FROM deduped
+    WHERE rn = 1
     GROUP BY market, confidence
     """
     return bq_client.query(query).to_dataframe()
@@ -204,8 +240,88 @@ def load_market_performance(days):
 @st.cache_data(ttl=3600)
 def load_run_type_performance(days):
     query = f"""
+    WITH deduped AS (
+        SELECT 
+            *,
+            ROW_NUMBER() OVER (
+                PARTITION BY 
+                    DATE(game_date),
+                    game_id,
+                    player_id,
+                    market,
+                    side
+                ORDER BY 
+                    CASE run_type WHEN 'AM' THEN 1 WHEN 'PM' THEN 2 ELSE 3 END,
+                    COALESCE(as_of_ts, TIMESTAMP('1970-01-01')) DESC
+            ) as rn
+        FROM `{PROJECT_ID}.{BQ_DATASET}.picks_fact_over_under_graded`
+        WHERE DATE(game_date) >= DATE_SUB(CURRENT_DATE('{BQ_TZ}'), INTERVAL {days} DAY)
+          AND actual_outcome IS NOT NULL
+          AND confidence IN ('elite','high')
+          AND run_type IS NOT NULL
+    )
     SELECT
         run_type,
+        COUNT(*) AS picks,
+        SUM(hit_flag) AS wins,
+        ROUND(AVG(hit_flag), 3) AS win_rate,
+        SUM(
+            CASE confidence
+                WHEN 'elite' THEN 3 * roi
+                WHEN 'high' THEN 2 * roi
+            END
+        ) AS profit_units
+    FROM deduped
+    WHERE rn = 1
+    GROUP BY run_type
+    ORDER BY run_type
+    """
+    return bq_client.query(query).to_dataframe()
+
+@st.cache_data(ttl=3600)
+def load_summary_stats(days):
+    query = f"""
+    WITH deduped AS (
+        SELECT 
+            *,
+            ROW_NUMBER() OVER (
+                PARTITION BY 
+                    DATE(game_date),
+                    game_id,
+                    player_id,
+                    market,
+                    side
+                ORDER BY 
+                    CASE run_type WHEN 'AM' THEN 1 WHEN 'PM' THEN 2 ELSE 3 END,
+                    COALESCE(as_of_ts, TIMESTAMP('1970-01-01')) DESC
+            ) as rn
+        FROM `{PROJECT_ID}.{BQ_DATASET}.picks_fact_over_under_graded`
+        WHERE DATE(game_date) >= DATE_SUB(CURRENT_DATE('{BQ_TZ}'), INTERVAL {days} DAY)
+          AND actual_outcome IS NOT NULL
+          AND confidence IN ('elite','high')
+    )
+    SELECT
+        COUNT(*) AS total_picks,
+        SUM(hit_flag) AS total_wins,
+        ROUND(AVG(hit_flag), 3) AS overall_win_rate,
+        SUM(
+            CASE confidence
+                WHEN 'elite' THEN 3 * roi
+                WHEN 'high' THEN 2 * roi
+            END
+        ) AS total_profit
+    FROM deduped
+    WHERE rn = 1
+    """
+    df = bq_client.query(query).to_dataframe()
+    return df.iloc[0] if not df.empty else None
+
+@st.cache_data(ttl=3600)
+def load_daily_performance_original(days):
+    # (kept for reference; not used)
+    query = f"""
+    SELECT
+        DATE(game_date) AS date,
         COUNT(*) AS picks,
         SUM(hit_flag) AS wins,
         ROUND(AVG(hit_flag), 3) AS win_rate,
@@ -219,32 +335,10 @@ def load_run_type_performance(days):
     WHERE DATE(game_date) >= DATE_SUB(CURRENT_DATE('{BQ_TZ}'), INTERVAL {days} DAY)
       AND actual_outcome IS NOT NULL
       AND confidence IN ('elite','high')
-      AND run_type IS NOT NULL
-    GROUP BY run_type
-    ORDER BY run_type
+    GROUP BY date
+    ORDER BY date DESC
     """
     return bq_client.query(query).to_dataframe()
-
-@st.cache_data(ttl=3600)
-def load_summary_stats(days):
-    query = f"""
-    SELECT
-        COUNT(*) AS total_picks,
-        SUM(hit_flag) AS total_wins,
-        ROUND(AVG(hit_flag), 3) AS overall_win_rate,
-        SUM(
-            CASE confidence
-                WHEN 'elite' THEN 3 * roi
-                WHEN 'high' THEN 2 * roi
-            END
-        ) AS total_profit
-    FROM `{PROJECT_ID}.{BQ_DATASET}.picks_fact_over_under_graded`
-    WHERE DATE(game_date) >= DATE_SUB(CURRENT_DATE('{BQ_TZ}'), INTERVAL {days} DAY)
-      AND actual_outcome IS NOT NULL
-      AND confidence IN ('elite','high')
-    """
-    df = bq_client.query(query).to_dataframe()
-    return df.iloc[0] if not df.empty else None
 
 # ============================================================
 # SHAP EXPLANATION HELPERS
